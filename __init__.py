@@ -1,4 +1,4 @@
-from . import checkpointsampling
+from . import workflowcheckpointing
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}

@@ -6,6 +6,7 @@ import aiohttp
 import asyncio
 import queue
 import threading
+import logging
 
 import comfy.samplers
 import execution
@@ -41,17 +42,20 @@ class RequestLoop:
             else:
                 self.low = req
     async def process_requests(self):
-        #https://storage-api.salad.com
-        async with aiohttp.ClientSession('http://127.0.0.1:8000') as session:
+        async with aiohttp.ClientSession() as session:
+            async with session.get('http://169.254.169.254:80/v1/token') as r:
+                token = await r.json()['jwt']
+        headers = {'Authorization': token}
+        async with aiohttp.ClientSession('https://storage-api.salad.com') as session:
             while True:
                 if self.active_request is None:
-                    await asyncio.sleep(1)
+                    await asyncio.sleep(.1)
                 else:
                     try:
                         req = self.active_request
-                        async with session.put(req[0],**req[1]) as r:
+                        async with session.put(req[0], headers=headers, **req[1]) as r:
                             #We don't care about result, but must still await it
-                            print(await r.text())
+                            await r.text()
                     except asyncio.CancelledError:
                         #TODO, ensure we only swallow our tasks?
                         pass
@@ -72,15 +76,21 @@ MACHINEID = "local"
 class NetCheckpoint:
     def __init__(self):
         self.requestloop = RequestLoop()
+        self.has_warned_size = False
     def store(self, unique_id, tensors, metadata, priority=0):
         file = "/".join(['', ORGANIZATION, MACHINEID, "checkpoint", f"{unique_id}.checkpoint"])
         data = safetensors.torch.save(tensors, metadata)
+        if len(data) > 10 ** 8:
+            if not self.has_warned_size:
+                logging.warning("Checkpoint is too large and has been skipped")
+                self.has_warned_size = True
+            return
         self.requestloop.queue((file, {'data': data}), priority)
     def get(self, unique_id):
         """Returns the information previously saved
            If the request has checkpointed data, this information should
            be loaded prior to job start"""
-        file = f"checkpoint/{unique_id}.checkpoint"
+        file = f"input/checkpoint/{unique_id}.checkpoint"
         if not os.path.exists(file):
             return None, None
         with safetensors.torch.safe_open(file, framework='pt' ) as f:
@@ -90,11 +100,11 @@ class NetCheckpoint:
     def reset(self, unique_id=None):
         """Clear all checkpoint information."""
         if unique_id is not None:
-            if os.path.exists(f"checkpoint/{unique_id}.checkpoint"):
-                os.remove(f"checkpoint/{unique_id}.checkpoint")
+            if os.path.exists(f"input/checkpoint/{unique_id}.checkpoint"):
+                os.remove(f"input/checkpoint/{unique_id}.checkpoint")
             return
-        for file in os.listdir("checkpoint"):
-            os.remove(os.path.join("checkpoint", file))
+        for file in os.listdir("input/checkpoint"):
+            os.remove(os.path.join("input/checkpoint", file))
 
 class FileCheckpoint:
     def store(self, unique_id, tensors, metadata, priority=0):
