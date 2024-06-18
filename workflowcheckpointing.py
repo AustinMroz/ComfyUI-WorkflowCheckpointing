@@ -218,11 +218,11 @@ prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST'
 original_post_prompt = prompt_route.handler
 async def post_prompt_remote(request):
     json_data = await request.json()
-    if "prompt" in json_data and "extra_data" in json_data and "SALAD_ORGANIZATION" in os.environ:
-        extra_data = json_data["extra_data"]
+    if "SALAD_ORGANIZATION" in os.environ:
+        extra_data = json_data.get("extra_data", {})
         #NOTE: Rendered obsolete by existing infrastructure, can be pruned
         remote_files = extra_data.get("remote_files", [])
-        uid = extra_data.get("uid", 'local')
+        uid = json_data.get("client_id", 'local')
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
     return await original_post_prompt(request)
