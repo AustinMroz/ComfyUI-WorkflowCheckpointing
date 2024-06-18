@@ -213,8 +213,10 @@ async def fetch_remote_files(remote_files, uid=None):
         if len(fetches) > 0:
             await asyncio.gather(*fetches)
 
-@server.PromptServer.instance.routes.post("/prompt_remote")
-async def post_prompt(request):
+prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST',
+                           server.PromptServer.instance.routes))
+original_post_prompt = prompt_route.handler
+async def post_prompt_remote(request):
     json_data = await request.json()
     if "prompt" in json_data and "extra_data" in json_data and "SALAD_ORGANIZATION" in os.environ:
         extra_data = json_data["extra_data"]
@@ -223,8 +225,9 @@ async def post_prompt(request):
         uid = extra_data.get("uid", 'local')
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
-    #probably a bad idea
-    return await server.PromptServer.instance.routes[15].handler(request)
+    return await original_post_prompt(request)
+#Dangerous
+object.__setattr__(prompt_route, 'handler', post_prompt_remote)
 
 class CheckpointSampler(comfy.samplers.KSAMPLER):
     def sample(self, *args, **kwargs):
