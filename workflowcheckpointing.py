@@ -35,6 +35,7 @@ class RequestLoop:
         self.queue_high = queue.Queue()
         self.low = None
         self.mutex = threading.RLock()
+        self.do_reset = False
         #main.py has already created an event loop
         event_loop = server.PromptServer.instance.loop
         self.process_loop = event_loop.create_task(self.process_requests())
@@ -55,23 +56,45 @@ class RequestLoop:
                     #self.process_loop.cancel()
             else:
                 self.low = req
+    def reset(self, uid):
+        with self.mutex:
+            self.low = None
+            self.queue_high = queue.Queue()
+            self.do_reset = uid
+    async def delete_file(self, s, url, semaphore):
+        async with semaphore:
+            async with s.delete(url, headers=await get_header()) as r:
+                await r.text()
+    async def _reset(self, s, uid):
+        base_url = '/organizations/' + ORGANIZATION +'/files'
+        checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
+        checkpoint_base = 'https://storage-api.salad.com' + checkpoint_base
+        async with s.get(base_url, headers=await get_header()) as r:
+            js = await r.json()
+            files = js['files']
+        checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
+        for cp in checkpoints:
+            cp['url'] = cp['url'][29:]
+        semaphore = asyncio.Semaphore(5)
+        deletes = [asyncio.create_task(self.delete_file(s, f['url'], semaphore)) for f in checkpoints]
+        if len(deletes) > 0:
+            await asyncio.gather(*deletes)
     async def process_requests(self):
         headers = await get_header()
         async with aiohttp.ClientSession('https://storage-api.salad.com') as session:
             while True:
+                if self.do_reset != False:
+                    await self._reset(session, self.do_reset)
+                    self.do_reset = False
                 if self.active_request is None:
                     await asyncio.sleep(.1)
                 else:
-                    try:
-                        req = self.active_request
-                        fd = aiohttp.FormData({'file': req[1]})
-                        async with session.put(req[0], headers=headers, data=fd) as r:
+                    req = self.active_request
+                    fd = aiohttp.FormData({'file': req[1]})
+                    async with session.put(req[0], headers=headers, data=fd) as r:
 
-                            #We don't care about result, but must still await it
-                            await r.text()
-                    except asyncio.CancelledError:
-                        #TODO, ensure we only swallow our tasks?
-                        pass
+                        #We don't care about result, but must still await it
+                        await r.text()
                 with self.mutex:
                     if not self.queue_high.empty():
                         self.active_request = self.queue_high.get()
@@ -110,8 +133,9 @@ class NetCheckpoint:
             tensors = {key:f.get_tensor(key) for key in f.keys()}
             return tensors, metadata
     def reset(self, unique_id=None):
+        #TODO: filter delete requests by node uniqueid
         """Clear all checkpoint information."""
-        #TODO: Find way to prune remote checkpoints
+        self.requestloop.reset(self.uid)
         if unique_id is not None:
             if os.path.exists(f"input/checkpoint/{unique_id}.checkpoint"):
                 os.remove(f"input/checkpoint/{unique_id}.checkpoint")
@@ -194,6 +218,7 @@ async def post_prompt(request):
     json_data = await request.json()
     if "prompt" in json_data and "extra_data" in json_data and "SALAD_ORGANIZATION" in os.environ:
         extra_data = json_data["extra_data"]
+        #NOTE: Rendered obsolete by existing infrastructure, can be pruned
         remote_files = extra_data.get("remote_files", [])
         uid = extra_data.get("uid", 'local')
         checkpoint.uid = uid
@@ -241,14 +266,13 @@ def recursive_execute_injection(*args):
     extra_data = args[4]
     if 'checkpoints' in extra_data:
         checkpoint.update(extra_data.pop('checkpoints'))
-    #Imperfect, is checked for each bubble down step
-    #Only applied once, but has unnecessary loads
-    if len(args[5]) == 0:
+    if 'prompt_checked' not in args[4]:
         metadata = checkpoint.get('prompt')[1]
         if metadata is None or json.loads(metadata['prompt']) != args[1]:
             checkpoint.reset()
             checkpoint.store('prompt', {'x': torch.ones(1)},
                              {'prompt': json.dumps(args[1])}, priority=2)
+        args[4]['prompt_checked'] = True
     if  class_type in SAMPLER_NODES:
         data, metadata = checkpoint.get(unique_id)
         if metadata is not None and 'step' in metadata:
