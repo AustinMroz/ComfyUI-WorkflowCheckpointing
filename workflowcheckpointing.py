@@ -267,6 +267,13 @@ async def fetch_remote_files(remote_files, uid=None):
     if len(fetches) > 0:
         await asyncio.gather(*fetches)
 
+completion_futures = {}
+def add_future(json_data):
+    index = max(completion_futures.keys())
+    json_data['extra_data']['completion_future'] = index
+    return json_data
+server.PromptServer.instance.add_on_prompt_handler(add_future)
+
 prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST',
                            server.PromptServer.instance.routes))
 original_post_prompt = prompt_route.handler
@@ -281,8 +288,15 @@ async def post_prompt_remote(request):
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
         if 'prompt' not in json_data:
-            return web.json_response("PreLoad Complete")
-    return await original_post_prompt(request)
+            return server.web.json_response("PreLoad Complete")
+    f = asyncio.Future()
+    index = max(completion_futures.keys(),default=0)+1
+    completion_futures[index] = f
+    base_res = await original_post_prompt(request)
+    res = await f
+    completion_futures.pop(index)
+    res = base_res.text[:-1] + ', "outputs": ' + json.dumps(res) + '}'
+    return server.web.Response(body=res)
 #Dangerous
 object.__setattr__(prompt_route, 'handler', post_prompt_remote)
 
@@ -336,6 +350,7 @@ def recursive_execute_injection(*args):
         args[4]['prompt_checked'] = True
         prev_outputs = {}
         os.makedirs("temp", exist_ok=True)
+        #TODO: Consider subdir recursing?
         for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
             if item.is_file():
                 prev_outputs[item.path] = item.stat().st_mtime
@@ -373,7 +388,8 @@ def recursive_execute_injection(*args):
         for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
             if item.is_file() and prev_outputs.get(item.path, 0) < item.stat().st_mtime:
                 outputs.append(item.path)
-        print(outputs)
+        if 'completion_future' in extra_data:
+            completion_futures[extra_data['completion_future']].set_result(outputs)
     return res
 
 comfy.samplers.KSAMPLER = CheckpointSampler
