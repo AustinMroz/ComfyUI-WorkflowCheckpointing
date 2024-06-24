@@ -143,7 +143,7 @@ class FetchLoop:
         #clear file
         with open(filepath, 'w') as f:
             pass
-        chunk_size = 2**27 #128MB
+        chunk_size = 2**26 #64MB
         chunks = []
         for i in range(0, total_size, chunk_size):
             header = {'Range': f'bytes={i*chunk_size}-{(i+1)*chunk_size}'}
@@ -280,6 +280,8 @@ async def post_prompt_remote(request):
         #uid = json_data.get("client_id", 'local')
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
+        if 'prompt' not in json_data:
+            return web.json_response("PreLoad Complete")
     return await original_post_prompt(request)
 #Dangerous
 object.__setattr__(prompt_route, 'handler', post_prompt_remote)
@@ -322,6 +324,7 @@ def recursive_execute_injection(*args):
     unique_id = args[3]
     class_type = args[1][unique_id]['class_type']
     extra_data = args[4]
+    prev_outputs = None
     if 'checkpoints' in extra_data:
         checkpoint.update(extra_data.pop('checkpoints'))
     if 'prompt_checked' not in args[4]:
@@ -331,6 +334,11 @@ def recursive_execute_injection(*args):
             checkpoint.store('prompt', {'x': torch.ones(1)},
                              {'prompt': json.dumps(args[1])}, priority=2)
         args[4]['prompt_checked'] = True
+        prev_outputs = {}
+        os.makedirs("temp", exist_ok=True)
+        for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
+            if item.is_file():
+                prev_outputs[item.path] = item.stat().st_mtime
     if  class_type in SAMPLER_NODES:
         data, metadata = checkpoint.get(unique_id)
         if metadata is not None and 'step' in metadata:
@@ -360,6 +368,12 @@ def recursive_execute_injection(*args):
                 data[str(x)] = torch.stack([l['samples'] for l in outputs[x]])
                 outputs[x] = 'latent'
         checkpoint.store(unique_id, data, {'completed': json.dumps(outputs)}, priority=1)
+    if prev_outputs is not None:
+        outputs = []
+        for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
+            if item.is_file() and prev_outputs.get(item.path, 0) < item.stat().st_mtime:
+                outputs.append(item.path)
+        print(outputs)
     return res
 
 comfy.samplers.KSAMPLER = CheckpointSampler
