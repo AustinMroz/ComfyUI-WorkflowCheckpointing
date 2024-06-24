@@ -104,6 +104,58 @@ class RequestLoop:
                             self.low = None
                         else:
                             self.active_request = None
+class FetchLoop:
+    def __init__(self):
+        self.queue = asyncio.PriorityQueue()
+        self.semaphore = asyncio.Semaphore(5)
+        self.cs = aiohttp.ClientSession()
+        event_loop = server.PromptServer.instance.loop
+        self.process_loop = event_loop.create_task(self.loop())
+    async def loop(self):
+        event_loop = server.PromptServer.instance.loop
+        while True:
+            await self.semaphore.acquire()
+            event_loop.create_task(self.fetch(*(await self.queue.get())[1:]))
+    def enqueue(self, url, callback, headers={}, priority=0, is_big=False):
+        #request -> (url, headers, callback?)
+        f = asyncio.Future()
+        self.queue.put_nowait((priority, url, callback, headers, f, is_big))
+        return f
+    async def fetch(self, url, callback, headers, future, is_big):
+        if not is_big:
+            try:
+                async with self.cs.get(url, headers=headers) as r:
+                    resp = await callback(r)
+                future.set_result(resp)
+            except:
+                future.set_result(None)
+                raise
+            finally:
+                self.semaphore.release()
+            return
+        priority, filepath = is_big
+        try:
+            #get size
+            async with self.cs.head(url, allow_redirects=True) as r:
+                total_size = int(r.headers['Content-Length'])
+        finally:
+            self.semaphore.release()
+        #clear file
+        with open(filepath, 'w') as f:
+            pass
+        chunk_size = 2**27 #128MB
+        chunks = []
+        for i in range(0, total_size, chunk_size):
+            header = {'Range': f'bytes={i*chunk_size}-{(i+1)*chunk_size}'}
+            async def stream_to_file(resp,offset=i):
+                with open(filepath, 'w+b') as f:
+                    f.seek(i*chunk_size)
+                    f.write(await resp.content.read())
+                return True
+            chunks.append(self.enqueue(url, stream_to_file, header, priority-1))
+        await asyncio.gather(*chunks)
+        future.set_result(True)
+fetch_loop = FetchLoop()
 
 ORGANIZATION = os.environ.get('SALAD_ORGANIZATION', None)
 class NetCheckpoint:
@@ -112,6 +164,7 @@ class NetCheckpoint:
         self.has_warned_size = False
         assert ORGANIZATION is not None
     def store(self, unique_id, tensors, metadata, priority=0):
+        return
         file = "/" + "/".join(['organizations', ORGANIZATION, 'files', self.uid,
                          "checkpoint", f"{unique_id}.checkpoint"])
         data = safetensors.torch.save(tensors, metadata)
@@ -179,39 +232,40 @@ def file_hash(filename):
             h.update(b)
     return h.hexdigest()
 
-async def fetch_remote_file(session, file, semaphore):
-    filename = os.path.join("input", file['filepath'])
+base_url = 'https://storage-api.salad.com/organizations/' + ORGANIZATION +'/files'
+def fetch_remote_file(url, filepath, file_hash=None):
+    filename = os.path.join("input", filepath)
     assert filename.find("..") == -1, "Paths may not contain .."
-    if os.path.exists(filename) and 'hash' in file and file_hash(filename) == file['hash']:
+    if os.path.exists(filename) and file_hash is not None and hash_file(filename) == file_hash:
         return
-    if file['url'].startswith('https://storage-api.salad.com/'):
-        headers = await get_header()
-    else:
-        headers = {}
-    async with semaphore:
-        async with session.get(file['url'], headers=headers) as r:
-            with open(filename, 'wb') as fd:
-                async for chunk in r.content.iter_chunked(2**16):
-                    fd.write(chunk)
+    async def stream_to_file(resp, file=filepath):
+        #TODO chunk reqeust for large files so they re-enter queue
+        with open(file, 'wb') as fd:
+            async for chunk in resp.content.iter_chunked(2**25):
+                fd.write(chunk)
+    is_big = url.startswith('https://civitai.com') or url.startswith('https://huggingface.co')
+    if is_big:
+        is_big = (-1, filepath)
+    header = get_header() if url.startswith(base_url) else {}
+    return fetch_loop.enqueue(url, stream_to_file, header, -1, is_big)
+
 
 async def fetch_remote_files(remote_files, uid=None):
     #TODO: Add requested support for zip files?
-    async with aiohttp.ClientSession() as s:
-        base_url = 'https://storage-api.salad.com/organizations/' + ORGANIZATION +'/files'
-        if uid is not None:
-            checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
-            async with s.get(base_url, headers=await get_header()) as r:
-                js = await r.json()
-                files = js['files']
-            checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
-            for cp in checkpoints:
-                cp['filepath'] = os.path.join('checkpoint',
-                                              cp['url'][len(checkpoint_base)+1:])
-            remote_files = itertools.chain(remote_files, checkpoints)
-        semaphore = asyncio.Semaphore(5)
-        fetches = [asyncio.create_task(fetch_remote_file(s, f, semaphore)) for f in remote_files]
-        if len(fetches) > 0:
-            await asyncio.gather(*fetches)
+    if uid is not None:
+        checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
+        js = await fetch_loop.enqueue(base_url, lambda x: x.json(), get_header(), -1)
+        files = js['files']
+        checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
+        for cp in checkpoints:
+            cp['filepath'] = os.path.join('checkpoint',
+                                          cp['url'][len(checkpoint_base)+1:])
+        remote_files = itertools.chain(remote_files, checkpoints)
+    fetches = []
+    for f in remote_files:
+        fetches.append(fetch_remote_file(**f))
+    if len(fetches) > 0:
+        await asyncio.gather(*fetches)
 
 prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST',
                            server.PromptServer.instance.routes))
@@ -222,7 +276,8 @@ async def post_prompt_remote(request):
         extra_data = json_data.get("extra_data", {})
         #NOTE: Rendered obsolete by existing infrastructure, can be pruned
         remote_files = extra_data.get("remote_files", [])
-        uid = json_data.get("client_id", 'local')
+        uid = None#temporarily disable s4 for testing
+        #uid = json_data.get("client_id", 'local')
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
     return await original_post_prompt(request)
