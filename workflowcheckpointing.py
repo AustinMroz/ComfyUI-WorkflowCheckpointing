@@ -185,7 +185,7 @@ class FetchLoop:
             ci = url.find(',')
             chunk_index = int(url[:ci])
             url = url[ci+1:]
-            headers.update({'Range': f'bytes={chunk_index*chunk_size}-{(chunk_index+1)*chunk_size}'})
+            headers.update({'Range': f'bytes={chunk_index*chunk_size}-{(chunk_index+1)*chunk_size}-1'})
         else:
             chunk_index = None
         filename = os.path.join('fetches', string_hash(url))
@@ -219,7 +219,7 @@ class FetchLoop:
         chunks = []
         #TODO: Race condition where multiple model downloads initiate before priority drops
         for i in range(0, total_size, chunk_size):
-            chunks.append(self.enqueue(f'{i},{url}', priority-1))
+            chunks.append(self.enqueue(f'{i//chunk_size},{url}', priority-1))
         await asyncio.gather(*chunks)
         future.set_result(filename)
 fetch_loop = FetchLoop()
@@ -344,6 +344,11 @@ prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST'
                            server.PromptServer.instance.routes))
 original_post_prompt = prompt_route.handler
 async def post_prompt_remote(request):
+    if 'dump_req' in os.environ:
+        with open('resp-dump.txt', 'wb') as f:
+            f.write(await request.read())
+        import sys
+        sys.exit()
     json_data = await request.json()
     if "SALAD_ORGANIZATION" in os.environ:
         extra_data = json_data.get("extra_data", {})
