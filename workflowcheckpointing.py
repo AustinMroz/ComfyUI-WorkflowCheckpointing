@@ -189,8 +189,6 @@ class FetchLoop:
                             awaken = asyncio.Future()
                             self.queue.enqueue_unchecked(awaken, priority-1)
                             await awaken
-                        else:
-                            print("got eof")
             future.set_result(filename)
         except:
             future.set_result(None)
@@ -201,7 +199,6 @@ class FetchLoop:
 fetch_loop = FetchLoop()
 async def prepare_file(url, path, priority):
     hashloc = await fetch_loop.enqueue(url, priority)
-    breakpoint()
     if os.path.exists(path):
         os.remove(path)
     #TODO consider if symlinking would be better
@@ -386,22 +383,6 @@ def recursive_execute_injection(*args):
     unique_id = args[3]
     class_type = args[1][unique_id]['class_type']
     extra_data = args[4]
-    prev_outputs = None
-    if 'checkpoints' in extra_data:
-        checkpoint.update(extra_data.pop('checkpoints'))
-    if 'prompt_checked' not in args[4]:
-        metadata = checkpoint.get('prompt')[1]
-        if metadata is None or json.loads(metadata['prompt']) != args[1]:
-            checkpoint.reset()
-            checkpoint.store('prompt', {'x': torch.ones(1)},
-                             {'prompt': json.dumps(args[1])}, priority=2)
-        args[4]['prompt_checked'] = True
-        prev_outputs = {}
-        os.makedirs("temp", exist_ok=True)
-        #TODO: Consider subdir recursing?
-        for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
-            if item.is_file():
-                prev_outputs[item.path] = item.stat().st_mtime
     if  class_type in SAMPLER_NODES:
         data, metadata = checkpoint.get(unique_id)
         if metadata is not None and 'step' in metadata:
@@ -431,17 +412,31 @@ def recursive_execute_injection(*args):
                 data[str(x)] = torch.stack([l['samples'] for l in outputs[x]])
                 outputs[x] = 'latent'
         checkpoint.store(unique_id, data, {'completed': json.dumps(outputs)}, priority=1)
-    if prev_outputs is not None:
-        outputs = []
-        for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
-            if item.is_file() and prev_outputs.get(item.path, 0) < item.stat().st_mtime:
-                outputs.append(item.path)
-        if 'completion_future' in extra_data:
-            completion_futures[extra_data['completion_future']].set_result(outputs)
     return res
+original_execute = execution.PromptExecutor.execute
+def execute_injection(*args, **kwargs):
+    metadata = checkpoint.get('prompt')[1]
+    if metadata is None or json.loads(metadata['prompt']) != args[1]:
+        checkpoint.reset()
+        checkpoint.store('prompt', {'x': torch.ones(1)},
+                         {'prompt': json.dumps(args[1])}, priority=2)
+    prev_outputs = {}
+    os.makedirs("temp", exist_ok=True)
+    #TODO: Consider subdir recursing?
+    for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
+        if item.is_file():
+            prev_outputs[item.path] = item.stat().st_mtime
+    original_execute(*args, **kwargs)
+    outputs = []
+    for item in itertools.chain(os.scandir("output"), os.scandir("temp")):
+        if item.is_file() and prev_outputs.get(item.path, 0) < item.stat().st_mtime:
+            outputs.append(item.path)
+    if 'completion_future' in args[3]:
+        completion_futures[args[3]['completion_future']].set_result(outputs)
 
 comfy.samplers.KSAMPLER = CheckpointSampler
 execution.recursive_execute = recursive_execute_injection
+execution.PromptExecutor.execute = execute_injection
 
 NODE_CLASS_MAPPINGS = {}
 NODE_DISPLAY_NAME_MAPPINGS = {}
