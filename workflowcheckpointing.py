@@ -122,24 +122,18 @@ class FetchQueue:
             self.queue[i] = (self.queue[i][0], self.queue[i][1], None, None)
             heapq.heappush(self.queue, (priority, self.count, item, future))
             self.count += 1
+    def requeue(self, future, item, dec_priority=1):
+        with self.lock:
+            priority = self.consumed[item][1] - dec_priority
+            heapq.heappush(self.queue, (priority, self.count, item, future))
+            self.count += 1
+            self.new_items.set()
     def enqueue_checked(self, item, priority):
         with self.lock:
             if item in self.consumed:
-                #check and update priority on sub chunks
-                updated_entries = []
-                for i in range(len(self.queue)):
-                    if self.queue[i][2].startswith('http'):
-                        continue
-                    url = self.queue[i][2][self.queue[i][2].find(',')+1:]
-                    if url == item:
-                        if self.queue[i][0] >= priority -1:
-                            break
-                        updated_entires.push(priority-1, self.queue[i][2], self.queue[i][3])
-                        self.queue[i] = (self.queue[i][0], self.queue[i][1], None, None)
-                for e in updated_entries:
-                    self.heapq.heappush(self.queue, (e[0], self.count, e[1], e[2]))
-                    self.count += 1
-                return self.consumed[item]
+                #TODO: Also update in queue
+                self.consumed[item][0] = min(self.consumed[item[0], priority])
+                return self.consumed[item][0]
             for i in range(len(self.queue)):
                 if self.queue[i][2] == item:
                     future = self.queue[i][3]
@@ -158,8 +152,12 @@ class FetchQueue:
                 if len(self.queue) == 0:
                     self.new_items.clear()
                 if item is not None:
-                    self.consumed[item] = future
-                    return priority, item, future
+                    if isinstance(item, str):
+                        self.consumed[item] = [future, priority]
+                        return priority, item, future
+                    else:
+                        #item is future
+                        item.set_result(True)
 
 class FetchLoop:
     def __init__(self):
@@ -177,54 +175,33 @@ class FetchLoop:
     def enqueue(self, url, priority=0):
         return self.queue.enqueue_checked(url, priority)
     async def fetch(self, priority, url, future):
-        chunk_size = 2**26 #64MB
+        chunk_size = 2**25 #32MB
         headers = {}
         if url.startswith(base_url):
             headers.update(await get_header())
-        if not url.startswith('http'):
-            ci = url.find(',')
-            chunk_index = int(url[:ci])
-            url = url[ci+1:]
-            headers.update({'Range': f'bytes={chunk_index*chunk_size}-{(chunk_index+1)*chunk_size}-1'})
-        else:
-            chunk_index = None
         filename = os.path.join('fetches', string_hash(url))
-        is_big = url.startswith('https://civitai.com') or url.startswith('https://huggingface.co')
-        if not is_big or chunk_index is not None:
-            try:
-                async with self.cs.get(url, headers=headers) as r:
-                    if chunk_index is not None:
-                        with open(filename, 'r+b') as f:
-                            f.seek(chunk_index)
-                            f.write(await r.read())
-                    else:
-                        with open(filename, 'wb') as f:
-                            f.write(await r.read())
-                future.set_result(filename)
-            except:
-                future.set_result(None)
-                raise
-            finally:
-                self.semaphore.release()
-            return
         try:
-            #get size
-            async with self.cs.head(url, allow_redirects=True) as r:
-                total_size = int(r.headers['Content-Length'])
+            async with self.cs.get(url, headers=headers) as r:
+                with open(filename, 'wb') as f:
+                    async for chunk in r.content.iter_chunked(chunk_size):
+                        f.write(chunk)
+                        if not r.content.is_eof():
+                            awaken = asyncio.Future()
+                            self.queue.enqueue_unchecked(awaken, priority-1)
+                            await awaken
+                        else:
+                            print("got eof")
+            future.set_result(filename)
+        except:
+            future.set_result(None)
+            raise
         finally:
             self.semaphore.release()
-        #clear file
-        with open(filename, 'w') as f:
-            pass
-        chunks = []
-        #TODO: Race condition where multiple model downloads initiate before priority drops
-        for i in range(0, total_size, chunk_size):
-            chunks.append(self.enqueue(f'{i//chunk_size},{url}', priority-1))
-        await asyncio.gather(*chunks)
-        future.set_result(filename)
+        return
 fetch_loop = FetchLoop()
 async def prepare_file(url, path, priority):
     hashloc = await fetch_loop.enqueue(url, priority)
+    breakpoint()
     if os.path.exists(path):
         os.remove(path)
     #TODO consider if symlinking would be better
