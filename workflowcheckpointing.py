@@ -13,6 +13,7 @@ import hashlib
 import comfy.samplers
 import execution
 import server
+import heapq
 
 SAMPLER_NODES = ["SamplerCustom", "KSampler", "KSamplerAdvanced", "SamplerCustomAdvanced"]
 
@@ -104,36 +105,108 @@ class RequestLoop:
                             self.low = None
                         else:
                             self.active_request = None
+
+class FetchQueue:
+    """Modified priority queue implementation that tracks inflight and allows priority modification"""
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.queue = []# queue contains priority, url, future
+        self.count = 0
+        self.consumed = {}
+        self.new_items = asyncio.Event()
+    def update_priority(self, i, priority):
+        #lock must already be acquired
+        future = self.queue[i][3]
+        if priority < self.queue[i][0]:
+            #priority is increased, invalidate old
+            self.queue[i] = (self.queue[i][0], self.queue[i][1], None, None)
+            heapq.heappush(self.queue, (priority, self.count, item, future))
+            self.count += 1
+    def enqueue_checked(self, item, priority):
+        with self.lock:
+            if item in self.consumed:
+                #check and update priority on sub chunks
+                updated_entries = []
+                for i in range(len(self.queue)):
+                    if self.queue[i][2].startswith('http'):
+                        continue
+                    url = self.queue[i][2][self.queue[i][2].find(',')+1:]
+                    if url == item:
+                        if self.queue[i][0] >= priority -1:
+                            break
+                        updated_entires.push(priority-1, self.queue[i][2], self.queue[i][3])
+                        self.queue[i] = (self.queue[i][0], self.queue[i][1], None, None)
+                for e in updated_entries:
+                    self.heapq.heappush(self.queue, (e[0], self.count, e[1], e[2]))
+                    self.count += 1
+                return self.consumed[item]
+            for i in range(len(self.queue)):
+                if self.queue[i][2] == item:
+                    future = self.queue[i][3]
+                    self.update_priority(i, priority)
+                    return future
+            future = asyncio.Future()
+            heapq.heappush(self.queue, (priority, self.count, item, future))
+            self.count += 1
+            self.new_items.set()
+            return future
+    async def get(self):
+        while True:
+            await self.new_items.wait()
+            with self.lock:
+                priority, _, item, future = heapq.heappop(self.queue)
+                if len(self.queue) == 0:
+                    self.new_items.clear()
+                if item is not None:
+                    self.consumed[item] = future
+                    return priority, item, future
+
 class FetchLoop:
     def __init__(self):
-        self.queue = asyncio.PriorityQueue()
+        self.queue = FetchQueue()
         self.semaphore = asyncio.Semaphore(5)
         self.cs = aiohttp.ClientSession()
         event_loop = server.PromptServer.instance.loop
         self.process_loop = event_loop.create_task(self.loop())
+        os.makedirs("fetches", exist_ok=True)
     async def loop(self):
         event_loop = server.PromptServer.instance.loop
         while True:
             await self.semaphore.acquire()
-            event_loop.create_task(self.fetch(*(await self.queue.get())[1:]))
-    def enqueue(self, url, callback, headers={}, priority=0, is_big=False):
-        #request -> (url, headers, callback?)
-        f = asyncio.Future()
-        self.queue.put_nowait((priority, url, callback, headers, f, is_big))
-        return f
-    async def fetch(self, url, callback, headers, future, is_big):
-        if not is_big:
+            event_loop.create_task(self.fetch(*(await self.queue.get())))
+    def enqueue(self, url, priority=0):
+        return self.queue.enqueue_checked(url, priority)
+    async def fetch(self, priority, url, future):
+        chunk_size = 2**26 #64MB
+        headers = {}
+        if url.startswith(base_url):
+            headers.update(await get_header())
+        if not url.startswith('http'):
+            ci = url.find(',')
+            chunk_index = int(url[:ci])
+            url = url[ci+1:]
+            headers.update({'Range': f'bytes={chunk_index*chunk_size}-{(chunk_index+1)*chunk_size}'})
+        else:
+            chunk_index = None
+        filename = os.path.join('fetches', string_hash(url))
+        is_big = url.startswith('https://civitai.com') or url.startswith('https://huggingface.co')
+        if not is_big or chunk_index is not None:
             try:
                 async with self.cs.get(url, headers=headers) as r:
-                    resp = await callback(r)
-                future.set_result(resp)
+                    if chunk_index is not None:
+                        with open(filename, 'r+b') as f:
+                            f.seek(chunk_index)
+                            f.write(await r.read())
+                    else:
+                        with open(filename, 'wb') as f:
+                            f.write(await r.read())
+                future.set_result(filename)
             except:
                 future.set_result(None)
                 raise
             finally:
                 self.semaphore.release()
             return
-        priority, filepath = is_big
         try:
             #get size
             async with self.cs.head(url, allow_redirects=True) as r:
@@ -141,23 +214,25 @@ class FetchLoop:
         finally:
             self.semaphore.release()
         #clear file
-        with open(filepath, 'w') as f:
+        with open(filename, 'w') as f:
             pass
-        chunk_size = 2**26 #64MB
         chunks = []
+        #TODO: Race condition where multiple model downloads initiate before priority drops
         for i in range(0, total_size, chunk_size):
-            header = {'Range': f'bytes={i*chunk_size}-{(i+1)*chunk_size}'}
-            async def stream_to_file(resp,offset=i):
-                with open(filepath, 'w+b') as f:
-                    f.seek(i*chunk_size)
-                    f.write(await resp.content.read())
-                return True
-            chunks.append(self.enqueue(url, stream_to_file, header, priority-1))
+            chunks.append(self.enqueue(f'{i},{url}', priority-1))
         await asyncio.gather(*chunks)
-        future.set_result(True)
+        future.set_result(filename)
 fetch_loop = FetchLoop()
+async def prepare_file(url, path, priority):
+    hashloc = await fetch_loop.enqueue(url, priority)
+    if os.path.exists(path):
+        os.remove(path)
+    #TODO consider if symlinking would be better
+    os.link(hashloc, path)
 
 ORGANIZATION = os.environ.get('SALAD_ORGANIZATION', None)
+if ORGANIZATION is not None:
+    base_url = 'https://storage-api.salad.com/organizations/' + ORGANIZATION +'/files'
 class NetCheckpoint:
     def __init__(self):
         self.requestloop = RequestLoop()
@@ -231,34 +306,25 @@ def file_hash(filename):
         while n := f.readinto(b):
             h.update(b)
     return h.hexdigest()
-
-base_url = 'https://storage-api.salad.com/organizations/' + ORGANIZATION +'/files'
+def string_hash(s):
+    h = hashlib.sha256()
+    h.update(s.encode('utf-8'))
+    return h.hexdigest()
 def fetch_remote_file(url, filepath, file_hash=None):
-    filename = os.path.join("input", filepath)
-    assert filename.find("..") == -1, "Paths may not contain .."
-    if os.path.exists(filename) and file_hash is not None and hash_file(filename) == file_hash:
-        return
-    async def stream_to_file(resp, file=filepath):
-        #TODO chunk reqeust for large files so they re-enter queue
-        with open(file, 'wb') as fd:
-            async for chunk in resp.content.iter_chunked(2**25):
-                fd.write(chunk)
-    is_big = url.startswith('https://civitai.com') or url.startswith('https://huggingface.co')
-    if is_big:
-        is_big = (-1, filepath)
-    header = get_header() if url.startswith(base_url) else {}
-    return fetch_loop.enqueue(url, stream_to_file, header, -1, is_big)
+    assert filepath.find("..") == -1, "Paths may not contain .."
+    return prepare_file(url, filepath, -1)
 
 
 async def fetch_remote_files(remote_files, uid=None):
     #TODO: Add requested support for zip files?
     if uid is not None:
         checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
-        js = await fetch_loop.enqueue(base_url, lambda x: x.json(), get_header(), -1)
+        async with self.cs.get(base_url, headers=get_header()) as r:
+            js = await r.json()
         files = js['files']
         checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
         for cp in checkpoints:
-            cp['filepath'] = os.path.join('checkpoint',
+            cp['filepath'] = os.path.join('input/checkpoint',
                                           cp['url'][len(checkpoint_base)+1:])
         remote_files = itertools.chain(remote_files, checkpoints)
     fetches = []
