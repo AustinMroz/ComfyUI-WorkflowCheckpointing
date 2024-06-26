@@ -136,7 +136,7 @@ class FetchQueue:
         with self.lock:
             if item in self.consumed:
                 #TODO: Also update in queue
-                self.consumed[item][0] = min(self.consumed[item][1], priority)
+                self.consumed[item][1] = min(self.consumed[item][1], priority)
                 return self.consumed[item][0]
             for i in range(len(self.queue)):
                 if self.queue[i][2] == item:
@@ -180,8 +180,8 @@ class FetchLoop:
         with self.queue.lock:
             if url in self.queue.consumed:
                 self.queue.consumed.pop(url)
-    async def enqueue(self, url, priority=0):
-        return await self.queue.enqueue_checked(url, priority)
+    def enqueue(self, url, priority=0):
+        return self.queue.enqueue_checked(url, priority)
     async def fetch(self, priority, url, future):
         chunk_size = 2**25 #32MB
         headers = {}
