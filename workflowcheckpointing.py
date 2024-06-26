@@ -24,6 +24,7 @@ async def get_header():
         return {'Salad-Api-Key': os.environ['SALAD_API_KEY']}
     global SALAD_TOKEN
     if SALAD_TOKEN is None:
+        assert 'SALAD_MACHINE_ID' in os.environ, "SALAD_API_KEY must be provided if not deployed"
         async with aiohttp.ClientSession() as session:
             async with session.get('http://169.254.169.254:80/v1/token') as r:
                 SALAD_TOKEN =(await r.json())['jwt']
@@ -67,10 +68,8 @@ class RequestLoop:
             async with s.delete(url, headers=await get_header()) as r:
                 await r.text()
     async def _reset(self, s, uid):
-        base_url = '/organizations/' + ORGANIZATION +'/files'
         checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
-        checkpoint_base = 'https://storage-api.salad.com' + checkpoint_base
-        async with s.get(base_url, headers=await get_header()) as r:
+        async with s.get(base_url_path, headers=await get_header()) as r:
             js = await r.json()
             files = js['files']
         checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
@@ -83,29 +82,34 @@ class RequestLoop:
     async def process_requests(self):
         headers = await get_header()
         async with aiohttp.ClientSession('https://storage-api.salad.com') as session:
-            while True:
-                if self.do_reset != False:
-                    await self._reset(session, self.do_reset)
-                    self.do_reset = False
-                if self.active_request is None:
-                    await asyncio.sleep(.1)
-                else:
-                    req = self.active_request
-                    fd = aiohttp.FormData({'file': req[1]})
-                    async with session.put(req[0], headers=headers, data=fd) as r:
-
-                        #We don't care about result, but must still await it
-                        await r.text()
-                with self.mutex:
-                    if not self.queue_high.empty():
-                        self.active_request = self.queue_high.get()
+            try:
+                while True:
+                    if self.do_reset != False:
+                        await self._reset(session, self.do_reset)
+                        self.do_reset = False
+                    if self.active_request is None:
+                        await asyncio.sleep(.1)
                     else:
-                        if self.low is not None:
-                            self.active_request = self.low
-                            self.low = None
-                        else:
-                            self.active_request = None
+                        req = self.active_request
+                        fd = aiohttp.FormData({'file': req[1]})
+                        async with session.put(req[0], headers=headers, data=fd) as r:
 
+                            #We don't care about result, but must still await it
+                            await r.text()
+                    with self.mutex:
+                        if not self.queue_high.empty():
+                            self.active_request = self.queue_high.get()
+                        else:
+                            if self.low is not None:
+                                self.active_request = self.low
+                                self.low = None
+                            else:
+                                self.active_request = None
+            except:
+                #Exceptions from event loop get swallowed and kill the loop
+                import traceback
+                traceback.print_exc()
+                raise
 class FetchQueue:
     """Modified priority queue implementation that tracks inflight and allows priority modification"""
     def __init__(self):
@@ -125,14 +129,14 @@ class FetchQueue:
     def requeue(self, future, item, dec_priority=1):
         with self.lock:
             priority = self.consumed[item][1] - dec_priority
-            heapq.heappush(self.queue, (priority, self.count, item, future))
+            heapq.heappush(self.queue, (priority, self.count, future, None))
             self.count += 1
             self.new_items.set()
     def enqueue_checked(self, item, priority):
         with self.lock:
             if item in self.consumed:
                 #TODO: Also update in queue
-                self.consumed[item][0] = min(self.consumed[item[0], priority])
+                self.consumed[item][0] = min(self.consumed[item][1], priority)
                 return self.consumed[item][0]
             for i in range(len(self.queue)):
                 if self.queue[i][2] == item:
@@ -172,8 +176,12 @@ class FetchLoop:
         while True:
             await self.semaphore.acquire()
             event_loop.create_task(self.fetch(*(await self.queue.get())))
-    def enqueue(self, url, priority=0):
-        return self.queue.enqueue_checked(url, priority)
+    def reset(self, url):
+        with self.queue.lock:
+            if url in self.queue.consumed:
+                self.queue.consumed.pop(url)
+    async def enqueue(self, url, priority=0):
+        return await self.queue.enqueue_checked(url, priority)
     async def fetch(self, priority, url, future):
         chunk_size = 2**25 #32MB
         headers = {}
@@ -187,7 +195,7 @@ class FetchLoop:
                         f.write(chunk)
                         if not r.content.is_eof():
                             awaken = asyncio.Future()
-                            self.queue.enqueue_unchecked(awaken, priority-1)
+                            self.queue.requeue(awaken, url)
                             await awaken
             future.set_result(filename)
         except:
@@ -206,14 +214,14 @@ async def prepare_file(url, path, priority):
 
 ORGANIZATION = os.environ.get('SALAD_ORGANIZATION', None)
 if ORGANIZATION is not None:
-    base_url = 'https://storage-api.salad.com/organizations/' + ORGANIZATION +'/files'
+    base_url_path = '/organizations/' + ORGANIZATION +'/files'
+    base_url = 'https://storage-api.salad.com' + base_url_path
 class NetCheckpoint:
     def __init__(self):
         self.requestloop = RequestLoop()
         self.has_warned_size = False
         assert ORGANIZATION is not None
     def store(self, unique_id, tensors, metadata, priority=0):
-        return
         file = "/" + "/".join(['organizations', ORGANIZATION, 'files', self.uid,
                          "checkpoint", f"{unique_id}.checkpoint"])
         data = safetensors.torch.save(tensors, metadata)
@@ -241,10 +249,12 @@ class NetCheckpoint:
         if unique_id is not None:
             if os.path.exists(f"input/checkpoint/{unique_id}.checkpoint"):
                 os.remove(f"input/checkpoint/{unique_id}.checkpoint")
+                fetch_loop.reset('/'.join([base_url, self.uid, 'checkpoint', f'{unique_id}.checkpoint']))
             return
         os.makedirs("input/checkpoint", exist_ok=True)
         for file in os.listdir("input/checkpoint"):
             os.remove(os.path.join("input/checkpoint", file))
+            fetch_loop.reset('/'.join([base_url, self.uid, 'checkpoint', file]))
 
 class FileCheckpoint:
     def store(self, unique_id, tensors, metadata, priority=0):
@@ -292,8 +302,9 @@ def fetch_remote_file(url, filepath, file_hash=None):
 async def fetch_remote_files(remote_files, uid=None):
     #TODO: Add requested support for zip files?
     if uid is not None:
-        checkpoint_base = '/'.join([base_url, uid, 'checkpoint'])
-        async with self.cs.get(base_url, headers=get_header()) as r:
+        checkpoint_base = '/'.join([base_url_path, uid, 'checkpoint'])
+        checkpoint_base = 'https://storage-api.salad.com'+ checkpoint_base
+        async with fetch_loop.cs.get(base_url, headers=await get_header()) as r:
             js = await r.json()
         files = js['files']
         checkpoints =  list(filter(lambda x: x['url'].startswith(checkpoint_base), files))
@@ -303,7 +314,7 @@ async def fetch_remote_files(remote_files, uid=None):
         remote_files = itertools.chain(remote_files, checkpoints)
     fetches = []
     for f in remote_files:
-        fetches.append(fetch_remote_file(**f))
+        fetches.append(fetch_remote_file(f['url'],f['filepath'], f.get('file_hash', None)))
     if len(fetches) > 0:
         await asyncio.gather(*fetches)
 
@@ -326,10 +337,8 @@ async def post_prompt_remote(request):
     json_data = await request.json()
     if "SALAD_ORGANIZATION" in os.environ:
         extra_data = json_data.get("extra_data", {})
-        #NOTE: Rendered obsolete by existing infrastructure, can be pruned
         remote_files = extra_data.get("remote_files", [])
-        uid = None#temporarily disable s4 for testing
-        #uid = json_data.get("client_id", 'local')
+        uid = json_data.get("client_id", 'local')
         checkpoint.uid = uid
         await fetch_remote_files(remote_files, uid=uid)
         if 'prompt' not in json_data:
@@ -338,9 +347,21 @@ async def post_prompt_remote(request):
     index = max(completion_futures.keys(),default=0)+1
     completion_futures[index] = f
     base_res = await original_post_prompt(request)
-    res = await f
+    outputs = await f
     completion_futures.pop(index)
-    res = base_res.text[:-1] + ', "outputs": ' + json.dumps(res) + '}'
+    if "SALAD_ORGANIZATION" in os.environ:
+        async with aiohttp.ClientSession('https://storage-api.salad.com') as s:
+            headers = await get_header()
+            for i in range(len(outputs)):
+                with open(outputs[i], 'rb') as f:
+                    data = f.read()
+                #TODO support uploads > 100MB/ memory optimizations
+                fd = {'file': data}
+                url = '/'.join([base_url_path, uid, 'outputs', outputs[i]])
+                async with s.put(url, headers=headers, data=fd) as r:
+                    await r.text()
+                outputs[i] = url
+    res = base_res.text[:-1] + ', "outputs": ' + json.dumps(outputs) + '}'
     return server.web.Response(body=res)
 #Dangerous
 object.__setattr__(prompt_route, 'handler', post_prompt_remote)
