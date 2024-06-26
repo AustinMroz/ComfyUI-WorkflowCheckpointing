@@ -35,6 +35,6 @@ async def startup(request):
 @ps.routes.get("/ready")
 async def ready(request):
     current_queue = ps.prompt_queue.get_current_queue()
-    if len(ps[0]) == 0 and len(ps[1]) == 0:
+    if len(current_queue[0]) == 0 and len(current_queue[1]) == 0:
         return web.json_response(current_queue)
     return web.json_response(current_queue, status=503)

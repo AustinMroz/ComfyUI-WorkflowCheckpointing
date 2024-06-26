@@ -136,6 +136,7 @@ class FetchQueue:
         with self.lock:
             if item in self.consumed:
                 #TODO: Also update in queue
+                #TODO: if complete check etag?
                 self.consumed[item][1] = min(self.consumed[item][1], priority)
                 return self.consumed[item][0]
             for i in range(len(self.queue)):
@@ -209,6 +210,7 @@ async def prepare_file(url, path, priority):
     hashloc = await fetch_loop.enqueue(url, priority)
     if os.path.exists(path):
         os.remove(path)
+    os.makedirs(os.path.split(path)[0], exist_ok=True)
     #TODO consider if symlinking would be better
     os.link(hashloc, path)
 
