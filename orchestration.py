@@ -8,16 +8,14 @@ ps = server.PromptServer.instance
 
 finished_startup = False
 original_server_start = ps.start
-async def server_start(*args, **kwargs):
-    args = list(args)
-    original_on_start= args[3]
+async def server_start(address, port, verbose=True, call_on_start=None):
+    original_on_start= call_on_start
     def on_start(scheme, address, port):
         if original_on_start is not None:
             original_on_start(scheme, address, port)
         global finished_startup
         finished_startup= True
-    args[3] = on_start
-    return await original_server_start(*args, **kwargs)
+    return await original_server_start(address, port, verbose, on_start)
 ps.start = server_start
 
 
