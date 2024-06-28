@@ -10,9 +10,9 @@ finished_startup = False
 original_server_start = ps.start
 async def server_start(address, port, verbose=True, call_on_start=None):
     original_on_start= call_on_start
-    def on_start(scheme, address, port):
+    def on_start(*args, **kwargs):
         if original_on_start is not None:
-            original_on_start(scheme, address, port)
+            original_on_start(*args, **kwargs)
         global finished_startup
         finished_startup= True
     return await original_server_start(address, port, verbose, on_start)
