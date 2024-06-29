@@ -1,7 +1,9 @@
+import json
+import os
 import server
 #Check for availability of workflow checkpointing
-import importlib
-#wcp = importlib.import_module('custom_nodes.ComfyUI-WorkflowCheckpointing.workflowcheckpointing')
+import aiohttp
+from .workflowcheckpointing import post_prompt_remote
 
 web = server.web
 ps = server.PromptServer.instance
@@ -36,3 +38,34 @@ async def ready(request):
     if len(current_queue[0]) == 0 and len(current_queue[1]) == 0:
         return web.json_response(current_queue)
     return web.json_response(current_queue, status=503)
+
+async def websocket_loop():
+    async with aiohttp.ClientSession() as session:
+        async with session.ws_connect(os.environ["ORCHESTRATION_SERVER"]) as ws:
+            print("connected to server")
+            async for msg in ws:
+                print("got command")
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    breakpoint()
+                    js = msg.json()
+                    match js['command']:
+                        case 'prompt':
+                            #wrap as mock request
+                            class MockRequest:
+                                async def json(self):
+                                    return js['data']
+                            resp = await post_prompt_remote(MockRequest())
+                            resp = json.loads(resp.body._value)
+                        case "queue":
+                            resp = ps.prompt_queue.get_current_queue()
+                        case "files":
+                            #Return a list of files, not yet implemented
+                            resp = "Not yet implemented"
+                        case _:
+                            resp = "Unknown command"
+                    print(resp)
+                    await ws.send_json(resp)
+                elif msg.type == aiohttp.WSMsgType.ERROR:
+                    await ws.send_json("Error")
+
+process_loop = ps.loop.create_task(websocket_loop())
