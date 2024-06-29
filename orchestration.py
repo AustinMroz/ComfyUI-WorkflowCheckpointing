@@ -44,28 +44,31 @@ async def websocket_loop():
         async with session.ws_connect(os.environ["ORCHESTRATION_SERVER"]) as ws:
             print("connected to server")
             async for msg in ws:
-                print("got command")
-                if msg.type == aiohttp.WSMsgType.TEXT:
-                    breakpoint()
-                    js = msg.json()
-                    match js['command']:
-                        case 'prompt':
-                            #wrap as mock request
-                            class MockRequest:
-                                async def json(self):
-                                    return js['data']
-                            resp = await post_prompt_remote(MockRequest())
-                            resp = json.loads(resp.body._value)
-                        case "queue":
-                            resp = ps.prompt_queue.get_current_queue()
-                        case "files":
-                            #Return a list of files, not yet implemented
-                            resp = "Not yet implemented"
-                        case _:
-                            resp = "Unknown command"
-                    print(resp)
-                    await ws.send_json(resp)
-                elif msg.type == aiohttp.WSMsgType.ERROR:
-                    await ws.send_json("Error")
+                try:
+                    print("got command")
+                    if msg.type == aiohttp.WSMsgType.TEXT:
+                        js = msg.json()
+                        match js['command']:
+                            case 'prompt':
+                                #wrap as mock request
+                                class MockRequest:
+                                    async def json(self):
+                                        return js['data']
+                                resp = await post_prompt_remote(MockRequest())
+                                resp = json.loads(resp.body._value)
+                            case "queue":
+                                resp = ps.prompt_queue.get_current_queue()
+                            case "files":
+                                #Return a list of files, not yet implemented
+                                resp = "Not yet implemented"
+                            case _:
+                                resp = "Unknown command"
+                        print(resp)
+                        await ws.send_json(resp)
+                    elif msg.type == aiohttp.WSMsgType.ERROR:
+                        await ws.send_json("Error")
+                except Exception as e:
+                    #NOTE: this will reraise if error was socket closing
+                    ws.send_json({"Error": str(e)})
 
 process_loop = ps.loop.create_task(websocket_loop())
