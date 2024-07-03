@@ -72,6 +72,9 @@ async def websocket_loop():
                                     resp['data']['machine_id'] = os.environ['SALAD_MACHINE_ID']
                                 else:
                                     resp['data']['machine_id'] = os.environ.get('HOSTNAME', 'local')
+                            case "logs":
+                                with open('comfyui.log', 'r') as f:
+                                    resp['data'] = f.read()
                             case _:
                                 resp = {"error": "Unknown command"}
                         print(resp)
