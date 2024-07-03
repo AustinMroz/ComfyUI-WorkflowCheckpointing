@@ -9,6 +9,7 @@ import threading
 import logging
 import itertools
 import hashlib
+import time
 
 import comfy.samplers
 import execution
@@ -348,8 +349,10 @@ async def post_prompt_remote(request):
     f = asyncio.Future()
     index = max(completion_futures.keys(),default=0)+1
     completion_futures[index] = f
+    start_time = time.perf_counter()
     base_res = await original_post_prompt(request)
     outputs = await f
+    execution_time = time.perf_counter() - start_time
     completion_futures.pop(index)
     if "SALAD_ORGANIZATION" in os.environ:
         async with aiohttp.ClientSession('https://storage-api.salad.com') as s:
@@ -358,13 +361,16 @@ async def post_prompt_remote(request):
                 with open(outputs[i], 'rb') as f:
                     data = f.read()
                 #TODO support uploads > 100MB/ memory optimizations
-                fd = {'file': data}
+                fd = {'file': data, 'sign': True}
                 url = '/'.join([base_url_path, uid, 'outputs', outputs[i]])
                 async with s.put(url, headers=headers, data=fd) as r:
-                    await r.text()
+                    url = await r.json()['url']
                 outputs[i] = url
-    res = base_res.text[:-1] + ', "outputs": ' + json.dumps(outputs) + '}'
-    return server.web.Response(body=res)
+    json_output = json.loads(base_res.text)
+    json_output['outputs'] = outputs
+    json_output['execution_time'] = execution_time
+    json_output['machineid'] = os.environ.get('SALAD_MACHINE_ID', "local")
+    return server.web.Response(body=json.dumps(json_output))
 #Dangerous
 object.__setattr__(prompt_route, 'handler', post_prompt_remote)
 

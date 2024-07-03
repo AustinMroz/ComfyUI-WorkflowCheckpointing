@@ -1,8 +1,10 @@
 import json
 import os
 import server
+import traceback
 #Check for availability of workflow checkpointing
 import aiohttp
+import asyncio
 from .workflowcheckpointing import post_prompt_remote
 
 web = server.web
@@ -41,6 +43,9 @@ async def ready(request):
 
 async def websocket_loop():
     async with aiohttp.ClientSession() as session:
+        if 'ORCHESTRATION_SERVER' not in os.environ:
+            while True:
+                await asyncio.sleep(60)
         async with session.ws_connect(os.environ["ORCHESTRATION_SERVER"]) as ws:
             print("connected to server")
             async for msg in ws:
@@ -48,27 +53,43 @@ async def websocket_loop():
                     print("got command")
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         js = msg.json()
+                        resp = {"message_id": js.get('message_id', 0)}
                         match js['command']:
                             case 'prompt':
                                 #wrap as mock request
                                 class MockRequest:
                                     async def json(self):
                                         return js['data']
-                                resp = await post_prompt_remote(MockRequest())
-                                resp = json.loads(resp.body._value)
+                                out = await post_prompt_remote(MockRequest())
+                                resp['data'] = json.loads(out.body._value)
                             case "queue":
-                                resp = ps.prompt_queue.get_current_queue()
+                                resp['data'] = ps.prompt_queue.get_current_queue()
                             case "files":
-                                #Return a list of files, not yet implemented
-                                resp = "Not yet implemented"
+                                resp['data'] = [f.name for f in os.scandir('fetches') if f.is_file()]
+                            case "info":
+                                resp['data'] = {}
+                                if 'SALAD_MACHINE_ID' in os.environ:
+                                    resp['data']['machine_id'] = os.environ['SALAD_MACHINE_ID']
+                                else:
+                                    resp['data']['machine_id'] = os.environ.get('HOSTNAME', 'local')
                             case _:
-                                resp = "Unknown command"
+                                resp = {"error": "Unknown command"}
                         print(resp)
                         await ws.send_json(resp)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
                         await ws.send_json("Error")
                 except Exception as e:
                     #NOTE: this will reraise if error was socket closing
-                    ws.send_json({"Error": str(e)})
+                    await ws.send_json({"Error": str(e)})
+async def try_websocket():
+    while True:
+        try:
+            await websocket_loop()
+        except aiohttp.client_exceptions.ClientConnectorError:
+            print("disconnected")
+        except:
+            print(traceback.format_exc())
+        await asyncio.sleep(5)
+        print("Attempting re connection")
 
-process_loop = ps.loop.create_task(websocket_loop())
+process_loop = ps.loop.create_task(try_websocket())
