@@ -50,7 +50,7 @@ async def websocket_loop():
             print("connected to server")
             async for msg in ws:
                 try:
-                    print("got command")
+                    print("got command: " + str(msg))
                     if msg.type == aiohttp.WSMsgType.TEXT:
                         js = msg.json()
                         resp = {"message_id": js.get('message_id', 0)}
@@ -77,10 +77,10 @@ async def websocket_loop():
                         print(resp)
                         await ws.send_json(resp)
                     elif msg.type == aiohttp.WSMsgType.ERROR:
-                        await ws.send_json("Error")
+                        await ws.send_json({"error": "Received bad message"})
                 except Exception as e:
                     #NOTE: this will reraise if error was socket closing
-                    await ws.send_json({"Error": str(e)})
+                    await ws.send_json({"error": str(e)})
 async def try_websocket():
     while True:
         try:

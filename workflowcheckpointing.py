@@ -182,6 +182,9 @@ class FetchLoop:
         with self.queue.lock:
             if url in self.queue.consumed:
                 self.queue.consumed.pop(url)
+        hashloc = os.path.join('fetches', string_hash(url))
+        if os.path.exists(hashloc):
+            os.remove(hashloc)
     def enqueue(self, url, priority=0):
         return self.queue.enqueue_checked(url, priority)
     async def fetch(self, priority, url, future):
@@ -208,7 +211,9 @@ class FetchLoop:
         return
 fetch_loop = FetchLoop()
 async def prepare_file(url, path, priority):
-    hashloc = await fetch_loop.enqueue(url, priority)
+    hashloc = os.path.join('fetches', string_hash(url))
+    if not os.path.exists(hashloc):
+        hashloc = await fetch_loop.enqueue(url, priority)
     if os.path.exists(path):
         os.remove(path)
     os.makedirs(os.path.split(path)[0], exist_ok=True)
@@ -361,10 +366,10 @@ async def post_prompt_remote(request):
                 with open(outputs[i], 'rb') as f:
                     data = f.read()
                 #TODO support uploads > 100MB/ memory optimizations
-                fd = {'file': data, 'sign': True}
+                fd = {'file': data, 'sign': 'true'}
                 url = '/'.join([base_url_path, uid, 'outputs', outputs[i]])
                 async with s.put(url, headers=headers, data=fd) as r:
-                    url = await r.json()['url']
+                    url = (await r.json())['url']
                 outputs[i] = url
     json_output = json.loads(base_res.text)
     json_output['outputs'] = outputs
