@@ -7,6 +7,8 @@ import aiohttp
 import asyncio
 from .workflowcheckpointing import post_prompt_remote
 
+STATIC_AUTH_TOKEN = os.environ.get("STATIC_AUTH_TOKEN", None)
+
 web = server.web
 ps = server.PromptServer.instance
 
@@ -46,7 +48,12 @@ async def websocket_loop():
         if 'ORCHESTRATION_SERVER' not in os.environ:
             while True:
                 await asyncio.sleep(60)
-        async with session.ws_connect(os.environ["ORCHESTRATION_SERVER"]) as ws:
+        if STATIC_AUTH_TOKEN:
+            headers = {"Authorization": f"Bearer {STATIC_AUTH_TOKEN}"}
+        else:
+            headers = None
+        async with session.ws_connect(os.environ["ORCHESTRATION_SERVER"],
+                                      headers=headers) as ws:
             print("connected to server")
             async for msg in ws:
                 try:
