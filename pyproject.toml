@@ -1,8 +1,8 @@
 [project]
 name = "comfyui-workflowcheckpointing"
 description = "Automatically creates checkpoints during workflow execution. If If an workflow is canceled or ComfyUI crashes mid-execution, then these checkpoints are used when the workflow is re-queued to resume execution with minimal progress loss."
-version = "1.0.0"
-license = "LICENSE"
+version = "1.0.1"
+license = { file = "LICENSE" }
 
 [project.urls]
 Repository = "https://github.com/AustinMroz/ComfyUI-WorkflowCheckpointing"
