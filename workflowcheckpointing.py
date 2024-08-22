@@ -411,17 +411,16 @@ class CheckpointSampler(comfy.samplers.KSAMPLER):
             if step == int(os.environ['FORCE_CRASH_AT']):
                 raise Exception("Simulated Crash")
 
-original_recursive_execute = execution.recursive_execute
+original_recursive_execute = execution.execute
 def recursive_execute_injection(*args):
-
     unique_id = args[3]
-    class_type = args[1][unique_id]['class_type']
+    class_type = args[1].get_node(unique_id)['class_type']
     extra_data = args[4]
     if  class_type in SAMPLER_NODES:
         data, metadata = checkpoint.get(unique_id)
         if metadata is not None and 'step' in metadata:
-            args[1][unique_id]['inputs']['latent_image'] = ['checkpointed'+unique_id, 0]
-            args[2]['checkpointed'+unique_id] = [[{'samples': data['x']}]]
+            args[1].get_node(unique_id)['inputs']['latent_image'] = ['checkpointed'+unique_id, 0]
+            args[2].outputs.set('checkpointed'+unique_id, [[{'samples': data['x']}]])
         elif metadata is not None and 'completed' in metadata:
             outputs = json.loads(metadata['completed'])
             for x in range(len(outputs)):
@@ -429,15 +428,15 @@ def recursive_execute_injection(*args):
                     outputs[x] = list(data[str(x)])
                 elif outputs[x] == 'latent':
                     outputs[x] = [{'samples': l} for l in data[str(x)]]
-            args[2][unique_id] = outputs
+            args[2].outputs.set(unique_id, outputs)
             return True, None, None
 
     res = original_recursive_execute(*args)
     #Conditionally save node output
     #TODO: determine which non-sampler nodes are worth saving
-    if class_type in SAMPLER_NODES and unique_id in args[2]:
+    if class_type in SAMPLER_NODES and args[2].outputs.get(unique_id) is not None:
         data = {}
-        outputs = args[2][unique_id].copy()
+        outputs = args[2].outputs.get(unique_id).copy()
         for x in range(len(outputs)):
             if isinstance(outputs[x][0], torch.Tensor):
                 data[str(x)] = torch.stack(outputs[x])
@@ -469,7 +468,7 @@ def execute_injection(*args, **kwargs):
         completion_futures[args[3]['completion_future']].set_result(outputs)
 
 comfy.samplers.KSAMPLER = CheckpointSampler
-execution.recursive_execute = recursive_execute_injection
+execution.execute = recursive_execute_injection
 execution.PromptExecutor.execute = execute_injection
 
 NODE_CLASS_MAPPINGS = {}
