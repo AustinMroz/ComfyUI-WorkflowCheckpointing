@@ -325,13 +325,6 @@ async def fetch_remote_files(remote_files, uid=None):
     if len(fetches) > 0:
         await asyncio.gather(*fetches)
 
-completion_futures = {}
-def add_future(json_data):
-    index = max(completion_futures.keys())
-    json_data['extra_data']['completion_future'] = index
-    return json_data
-server.PromptServer.instance.add_on_prompt_handler(add_future)
-
 prompt_route = next(filter(lambda x: x.path  == '/prompt' and x.method == 'POST',
                            server.PromptServer.instance.routes))
 original_post_prompt = prompt_route.handler
